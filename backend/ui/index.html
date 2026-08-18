@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agno Browser Bridge</title>
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">A</div>
+          <div>
+            <h1>Agno Bridge</h1>
+            <p>Local browser-aware runtime</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <label for="origin">Origin</label>
+          <input id="origin" value="https://example.com" placeholder="https://example.com" />
+        </div>
+
+        <div class="panel toggle-row">
+          <label for="browserTools">Browser tools enabled</label>
+          <input id="browserTools" type="checkbox" />
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <div class="chat-header">
+          <h2>Agent chat</h2>
+          <button id="clearChat">Clear</button>
+        </div>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="chatForm" class="composer">
+          <textarea id="prompt" rows="4" placeholder="Ask the agent to calculate something, read local context, or trigger a browser action..."></textarea>
+          <div class="composer-actions">
+            <button type="submit" class="primary">Send</button>
+          </div>
+        </form>
+      </main>
+
+      <aside class="trace-panel">
+        <h3>Tool trace</h3>
+        <ul id="traceList" class="trace-list"></ul>
+      </aside>
+    </div>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>

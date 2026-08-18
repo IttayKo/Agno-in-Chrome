@@ -1,0 +1,9 @@
+backend/.venv/
+**/__pycache__/
+*.pyc
+backend/agno_sessions.db
+backend/.env
+.impeccable/
+.DS_Store
+.vscode/
+.idea/

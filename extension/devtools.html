@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Agno DevTools</title>
+  </head>
+  <body>
+    <script>
+      // Create a DevTools panel that loads an extension page
+      try {
+        chrome.devtools.panels.create('Agno', 'icon48.png', 'devtools_panel.html', function(panel) {
+          console.log('Agno DevTools panel created');
+        });
+      } catch (e) {
+        console.warn('DevTools panel creation failed', e);
+      }
+
+      // Create a sidebar in Elements panel for quick trace inspection
+      try {
+        chrome.devtools.panels.elements.createSidebarPane('Agno Trace', function(sidebar) {
+          sidebar.setPage('devtools_panel.html');
+          sidebar.setHeight('40%');
+        });
+      } catch (e) {
+        console.warn('DevTools sidebar creation failed', e);
+      }
+    </script>
+  </body>
+</html>

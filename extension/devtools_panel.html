@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agno DevTools Panel</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="panel-shell">
+      <div class="panel-top">
+        <div class="panel-title">
+          <div class="mark">A</div>
+          <div class="title-text">
+            <div class="name">Agno Bridge</div>
+            <div class="subtitle">DevTools panel</div>
+          </div>
+        </div>
+        <div class="top-actions">
+          <span id="statusBox" class="status-pill" data-state="idle">
+            <span class="status-dot"></span>
+            <span class="status-text">Ready</span>
+          </span>
+          <button id="clearBtn" class="icon-btn" title="Clear conversation" aria-label="Clear conversation">↺</button>
+          <button id="devFocusBtn" class="icon-btn" title="Open full dashboard" aria-label="Open full dashboard">⤢</button>
+        </div>
+      </div>
+
+      <div class="panel-body">
+        <div class="left">
+          <div id="messages" class="messages" role="log" aria-live="polite"></div>
+          <div class="composer">
+            <div class="composer-row">
+              <input id="quickCmd" placeholder="Ask Agno or run a tool…" autocomplete="off" />
+              <button id="sendBtn" class="send">Send</button>
+            </div>
+            <div class="composer-meta">
+              <label class="meta-item"><input id="browserToolsInput" type="checkbox" checked /> Browser tools</label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+    <script>
+      document.getElementById('devFocusBtn').addEventListener('click', () => {
+        try { chrome.tabs.create({ url: 'http://127.0.0.1:8000/' }); } catch (e) { console.warn(e); }
+      });
+    </script>
+  </body>
+</html>

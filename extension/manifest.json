@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Agno Bridge",
+  "version": "0.1.0",
+  "description": "Bridge between Agno agent runtime and Chrome via CDP (debugger).",
+  "permissions": [
+    "debugger",
+    "activeTab",
+    "tabs",
+    "storage",
+    "sidePanel"
+  ],
+  "action": {
+    "default_title": "Agno Bridge"
+  },
+  "devtools_page": "devtools.html",
+  "side_panel": { "default_path": "sidepanel.html" },
+  "web_accessible_resources": [
+    {
+      "resources": ["sidepanel.html","popup.html","popup.css","popup.js","icon48.png","devtools_panel.html","devtools.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "48": "icon48.png"
+  }
+}
