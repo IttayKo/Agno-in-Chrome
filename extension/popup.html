@@ -17,9 +17,17 @@
           </div>
         </div>
         <div class="top-actions">
-          <select id="modelSelect" title="Select model">
-            <option value="deepseek">DeepSeek v4 Flash</option>
-            <option value="gemini">Gemini 3.6 Flash</option>
+          <!-- Both selects are populated from GET /agent/models at panel open;
+               these options are only the fallback shown when the backend is
+               unreachable. An empty value means "don't send one", i.e. use
+               whatever the backend is configured for. -->
+          <select id="modelSelect" title="Model provider">
+            <option value="">Default model</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="gemini">Gemini</option>
+          </select>
+          <select id="styleSelect" title="Reasoning style">
+            <option value="">Auto style</option>
           </select>
           <span id="statusBox" class="status-pill" data-state="idle">
             <span class="status-dot"></span>

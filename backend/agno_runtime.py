@@ -28,12 +28,28 @@ from runtime import (  # noqa: F401
 )
 
 # The communication-style seam (runtime/reasoning.py).
-from runtime.reasoning import ReasoningStyle, register_style, resolve_style  # noqa: F401
+from runtime.reasoning import (  # noqa: F401
+    ReasoningStyle,
+    available_styles,
+    register_style,
+    resolve_style,
+)
+
+# The model factories: `get_model` (Agno models, native backend) and
+# `get_langchain_model` (LangChain chat models, LangGraph/DeepAgents backend).
+from runtime.models import (  # noqa: F401
+    available_langchain_providers,
+    available_providers,
+    get_langchain_model,
+    register_langchain_provider,
+    register_provider,
+    resolve_thinking,
+)
 
 # Everything else that used to be a module-level name here, re-exported so that
 # older imports (including the underscore-prefixed internals a few call sites
 # and tests reach for) keep resolving.
-from runtime.models import DeepSeek, Gemini, OpenAIChat, google_types  # noqa: F401
+from runtime.models import Claude, DeepSeek, Gemini, OpenAIChat, google_types  # noqa: F401
 from runtime.agent import (  # noqa: F401
     _demo,
     _shared_db,
@@ -98,6 +114,7 @@ from runtime.graph import (  # noqa: F401
 
 __all__ = [
     "get_model",
+    "get_langchain_model",
     "build_agent",
     "run_prompt",
     "stream_agno_events",

@@ -13,7 +13,24 @@ from .context import (
     _make_load_asset_tool_for_deepagents,
     _mcp_tools_for_deepagents,
 )
-from .reasoning import DEEPAGENTS_PROVIDER, THINKING, ReasoningStyle, resolve_style
+from .models import get_langchain_model, resolve_langchain_provider
+from .reasoning import THINKING, ReasoningStyle, resolve_style
+
+
+#: Display names for the graph's `name=` argument, so a DeepSeek harness is
+#: still literally named "Deep Agent (DeepSeek)" as it was when the provider was
+#: hardcoded. Anything unlisted just uses the provider name as given.
+_PROVIDER_LABELS: Dict[str, str] = {
+    "deepseek": "DeepSeek",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "claude": "Anthropic",
+    "gemini": "Gemini",
+    "google": "Gemini",
+    "vllm": "vLLM",
+    "openai_compatible": "OpenAI-compatible",
+    "custom": "Custom",
+}
 
 
 def _load_langgraph_graph(graph_path: Optional[str] = None):
@@ -69,8 +86,14 @@ async def build_deepagents_graph(
     mcp_servers: Optional[List[dict]] = None,
     tool_meta: Optional[Dict[str, dict]] = None,
     reasoning_style: Optional[str] = None,
+    model_provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    thinking=None,
+    thinking_budget=None,
 ):
-    """Build the default DeepAgents graph, configured with DeepSeek — this is
+    """Build the default DeepAgents graph, configured with DeepSeek by default — this is
     what AGNO_BACKEND=langgraph uses out of the box when no LANGGRAPH_GRAPH
     override is set, so switching the default backend to LangGraph actually
     works rather than requiring the user to hand-wire a graph first.
@@ -93,21 +116,30 @@ async def build_deepagents_graph(
     _mcp_tools_for_deepagents) — DeepAgents has no lazy per-run auto-connect
     the way Agno's native MCPTools does.
 
+    `model_provider`/`model_id`/`base_url`/`api_key` pick the LangChain chat
+    model this harness runs on, each falling back to its environment variable
+    and then to the historical default (see runtime.models.get_langchain_model):
+    with nothing configured this is still DeepSeek via ChatDeepSeek, exactly as
+    when the model here was hardcoded. `thinking`/`thinking_budget` request
+    reasoning output from providers that need to be asked for it (Anthropic,
+    Gemini, OpenAI reasoning models); unset means nothing is sent and the
+    provider's own default applies — which is all DeepSeek ever needed.
+
     `reasoning_style` names the communication style used to tell this model's
     thinking apart from its answer text (see runtime/reasoning.py); None means
-    AGNO_REASONING_STYLE and then "auto", which resolves from this harness's
-    provider — DeepSeek, since the model below is pinned to ChatDeepSeek.
+    AGNO_REASONING_STYLE and then "auto", which resolves from the provider this
+    harness just built for.
 
     Returns (graph, tool_meta, style) — tool_meta is passed straight through, for
     build_langgraph_agent to attach to the wrapping agent, and style is the
     resolved ReasoningStyle for the model this harness just built, which
     build_langgraph_agent hands to the streaming adapter. This function is the
-    only place that knows which provider the default harness uses, so it is also
-    the right place to answer "how does this model express thinking?".
+    only place that knows which provider the harness ended up on (the name is
+    resolved here, from the request/env/default chain), so it is also the right
+    place to answer "how does this model express thinking?".
     """
     try:
         from deepagents import create_deep_agent
-        from langchain_deepseek import ChatDeepSeek
     except ImportError as exc:
         raise RuntimeError(
             "deepagents/langchain-deepseek are required for the default LangGraph backend. "
@@ -116,16 +148,21 @@ async def build_deepagents_graph(
 
     origin = origin or os.getenv("BROWSER_ORIGIN", "https://example.com")
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not set — required for the default DeepAgents/DeepSeek harness.")
-    model_id = os.getenv("AGNO_MODEL", "deepseek-v4-flash")
-    # langchain_deepseek.ChatDeepSeek, not plain langchain_openai.ChatOpenAI pointed
-    # at DeepSeek's endpoint — verified empirically that ChatOpenAI's SSE parser
-    # doesn't recognize DeepSeek's `reasoning_content` delta field and silently
-    # drops it, so reasoning would never reach the thinking-block UI at all. Also
-    # handles DeepSeek's thinking-mode request shape itself, no manual extra_body needed.
-    llm_model = ChatDeepSeek(model=model_id, api_key=api_key)
+    # Which chat model this harness runs on is runtime.models' business now, not
+    # this function's: it owns the per-provider client classes, API-key env vars
+    # and thinking arguments (including the reason ChatDeepSeek specifically is
+    # used for DeepSeek — see _build_lc_deepseek, where that comment now lives
+    # next to the call it explains). This module only resolves the provider name
+    # first, because it needs it a second time below to pick the reasoning style.
+    provider = resolve_langchain_provider(model_provider)
+    llm_model = get_langchain_model(
+        api_key=api_key,
+        provider=provider,
+        model_id=model_id,
+        base_url=base_url,
+        thinking=thinking,
+        thinking_budget=thinking_budget,
+    )
 
     tools = _deepagents_browser_tools(_OriginState(origin)) if include_browser_tools else []
     if extra_tools:
@@ -150,9 +187,9 @@ async def build_deepagents_graph(
         model=llm_model,
         tools=tools,
         system_prompt=system_prompt,
-        name="Deep Agent (DeepSeek)",
+        name=f"Deep Agent ({_PROVIDER_LABELS.get(provider, provider)})",
     )
-    style = resolve_style(reasoning_style, DEEPAGENTS_PROVIDER)
+    style = resolve_style(reasoning_style, provider)
     return graph, (tool_meta or {}), style
 
 
@@ -267,6 +304,12 @@ async def build_langgraph_agent(
     mcp_servers: Optional[List[dict]] = None,
     tool_meta: Optional[Dict[str, dict]] = None,
     reasoning_style: Optional[str] = None,
+    model_provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    thinking=None,
+    thinking_budget=None,
 ):
     """Build an Agno `LangGraphAgent` (extended with reasoning/thinking support —
     see _make_reasoning_langgraph_agent_class) wrapping a compiled LangGraph
@@ -293,10 +336,15 @@ async def build_langgraph_agent(
     conversation continuity — one history mechanism for both backends, not a
     second bespoke one.
 
+    `model_provider`/`model_id`/`base_url`/`api_key`/`thinking`/
+    `thinking_budget` configure the model of the *default* harness only (they
+    are forwarded to build_deepagents_graph); a custom LANGGRAPH_GRAPH built its
+    own model when it was constructed, and nothing here can reach into it.
+
     `reasoning_style` names the communication style the adapter uses to tell
     thinking apart from answer text (see runtime/reasoning.py). With the default
     harness the style comes back from build_deepagents_graph, which knows the
-    provider it just pinned; with a custom LANGGRAPH_GRAPH the provider is
+    provider it just built for; with a custom LANGGRAPH_GRAPH the provider is
     unknowable here, so it resolves from the name/env/auto default alone.
 
     `async def` because build_deepagents_graph is (MCP tool loading for
@@ -335,6 +383,12 @@ async def build_langgraph_agent(
             mcp_servers=mcp_servers,
             tool_meta=tool_meta,
             reasoning_style=reasoning_style,
+            model_provider=model_provider,
+            model_id=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
         )
 
     agent = ReasoningLangGraphAgent(name="LangGraph Agent", graph=graph, db=_shared_db)

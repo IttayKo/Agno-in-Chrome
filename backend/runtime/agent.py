@@ -16,7 +16,8 @@ from .browser_tools import (
     execute_local_cli,
 )
 from .context import _asset_index, _make_load_asset_tool_for_agno, _mcp_tools_for_agno
-from .models import get_model
+from .models import get_model, resolve_provider
+from .reasoning import resolve_style
 
 # Agno only adds prior turns to context when the agent has a db to read history from
 # (add_history_to_context=True is a silent no-op without one). This is a module-level
@@ -65,6 +66,9 @@ def build_agent(
     knowledge: Optional[List[dict]] = None,
     mcp_servers: Optional[List[dict]] = None,
     tool_meta: Optional[Dict[str, dict]] = None,
+    reasoning_style: Optional[str] = None,
+    thinking=None,
+    thinking_budget=None,
 ) -> Agent:
     """Generic context-injection surface for this Agno agent: `extra_tools`
     (pre-built Function/Toolkit objects), `extra_system_prompt` (appended text),
@@ -79,10 +83,24 @@ def build_agent(
     That's extension-specific glue and lives in server.py; this module stays
     usable by any caller with its own way of sourcing tools/mcps/skills (see
     the module docstring: "usable independently of the browser extension").
+
+    `thinking`/`thinking_budget` ask the provider for reasoning output where it
+    has to be asked (see runtime/models.py); unset sends nothing, as before.
+    `reasoning_style` names the communication style stream_agno_events uses for
+    this agent's run events (see runtime/reasoning.py); None resolves it from
+    AGNO_REASONING_STYLE and then from the model provider selected here.
     """
     origin = origin or os.getenv("BROWSER_ORIGIN", "https://example.com")
     origin_state = _OriginState(origin)
-    model = get_model(api_key=api_key, provider=model_provider, model_id=model_id, base_url=base_url)
+    provider = resolve_provider(model_provider)
+    model = get_model(
+        api_key=api_key,
+        provider=provider,
+        model_id=model_id,
+        base_url=base_url,
+        thinking=thinking,
+        thinking_budget=thinking_budget,
+    )
 
     tools = [
         Function(
@@ -151,6 +169,13 @@ def build_agent(
         add_history_to_context=True,
     )
     agent._tool_meta = tool_meta or {}
+    # Read back by stream_agno_events. Every registered style normalizes a
+    # native Agent's run events identically (they all share event_pieces), so
+    # this is inert today for the native backend — it exists so that a request
+    # can carry a style for both backends through the same field, and so a
+    # style that *does* need to special-case Agno events later has somewhere to
+    # be attached.
+    agent._reasoning_style = resolve_style(reasoning_style, provider)
     return agent
 
 

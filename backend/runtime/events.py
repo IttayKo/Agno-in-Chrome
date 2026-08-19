@@ -147,6 +147,11 @@ async def stream_langgraph_events(
     mcp_servers: Optional[List[dict]] = None,
     tool_meta: Optional[Dict[str, dict]] = None,
     reasoning_style: Optional[str] = None,
+    model_provider: Optional[str] = None,
+    model_id: Optional[str] = None,
+    base_url: Optional[str] = None,
+    thinking=None,
+    thinking_budget=None,
 ):
     """Drive a DeepAgents/LangGraph graph through Agno's own LangGraphAgent
     adapter and yield the same event protocol as stream_agno_events — this is a
@@ -164,11 +169,19 @@ async def stream_langgraph_events(
     from answer text (see runtime/reasoning.py); None means AGNO_REASONING_STYLE
     and then "auto", i.e. resolve it from the graph's model provider.
 
-    Known limitations, both inherent to Agno's LangGraphAgent adapter itself
-    (not something this wrapper patches around): it doesn't stream reasoning/
-    thinking content the way the native backend does, and it has no cooperative
+    `model_provider`/`model_id`/`base_url`/`thinking`/`thinking_budget` select
+    and configure the model the default DeepAgents harness runs on (request
+    value -> env var -> default; see runtime.models.get_langchain_model). Like
+    the context params they do nothing when a custom graph is configured, which
+    built its own model already.
+
+    Known limitation, inherent to Agno's LangGraphAgent adapter itself (not
+    something this wrapper patches around): it has no cooperative
     Agent.cancel_run equivalent, so Stop falls back to a hard task cancel for
     this backend (see server.py) rather than the graceful stop used natively.
+    Reasoning/thinking content, which the stock adapter dropped, *is* streamed
+    here — build_langgraph_agent wraps the graph in the reasoning subclass (see
+    runtime.graph._make_reasoning_langgraph_agent_class) that emits it.
     """
     try:
         agent = await build_langgraph_agent(
@@ -182,6 +195,11 @@ async def stream_langgraph_events(
             mcp_servers=mcp_servers,
             tool_meta=tool_meta,
             reasoning_style=reasoning_style,
+            model_provider=model_provider,
+            model_id=model_id,
+            base_url=base_url,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
         )
     except Exception as exc:
         yield {'type': 'error', 'error': str(exc)}

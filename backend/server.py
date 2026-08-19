@@ -25,7 +25,7 @@ import time
 import shlex
 import subprocess
 import httpx
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 # Load .env at process start, not as a side effect of the first request that
 # happens to lazily `from agno_runtime import ...`. AGNO_BACKEND (and every
@@ -102,6 +102,15 @@ class ChatPayload(BaseModel):
     langgraph_graph: Optional[str] = None  # overrides LANGGRAPH_GRAPH, 'module.path:graph_var'
     thread_id: Optional[str] = None        # LangGraph checkpointer thread id
     session_id: Optional[str] = None       # stable per-conversation id so later turns see earlier ones
+    # How this model expresses thinking vs. answer text: a registered style name
+    # from runtime/reasoning.py ('deepseek' | 'openai' | 'anthropic' | 'gemini' |
+    # 'plain'), or 'auto'/None to resolve it from the selected provider.
+    reasoning_style: Optional[str] = None
+    # Ask the provider for thinking output where it has to be asked (Anthropic,
+    # Gemini, OpenAI reasoning models). None = leave it to AGNO_THINKING, and to
+    # the provider's own default if that is unset too — see runtime/models.py.
+    thinking: Optional[Union[bool, str]] = None   # true/false, '1'/'0', or 'low'/'medium'/'high'
+    thinking_budget: Optional[int] = None  # thinking token budget, where supported
 
 @app.get('/', response_class=HTMLResponse)
 async def read_root():
@@ -131,6 +140,16 @@ async def chat(payload: ChatPayload):
                 knowledge=ctx_kwargs.get('knowledge'),
                 mcp_servers=ctx_kwargs.get('mcp_servers'),
                 tool_meta=ctx_kwargs.get('tool_meta'),
+                # Model/style selection reaches this backend too: before, these
+                # payload fields were honored only by the native branch below,
+                # so the panel's model picker silently did nothing whenever the
+                # LangGraph backend was active.
+                model_provider=payload.model_provider,
+                model_id=payload.model_id,
+                base_url=payload.base_url,
+                reasoning_style=payload.reasoning_style,
+                thinking=payload.thinking,
+                thinking_budget=payload.thinking_budget,
             ):
                 if evt.get('type') == 'assistant.delta':
                     response_parts.append(evt.get('chunk') or '')
@@ -155,6 +174,9 @@ async def chat(payload: ChatPayload):
             knowledge=ctx_kwargs.get('knowledge'),
             mcp_servers=ctx_kwargs.get('mcp_servers'),
             tool_meta=ctx_kwargs.get('tool_meta'),
+            reasoning_style=payload.reasoning_style,
+            thinking=payload.thinking,
+            thinking_budget=payload.thinking_budget,
         )
         result = await agent.arun(payload.prompt)
         response = getattr(result, 'content', str(result))
@@ -172,6 +194,60 @@ async def chat(payload: ChatPayload):
         return {'response': response, 'tool_trace': trace, 'status': 'ok'}
     except Exception as exc:
         return JSONResponse({'status': 'error', 'error': str(exc)}, status_code=500)
+
+@app.get('/agent/models')
+async def list_models():
+    """What this backend can be pointed at: providers per backend, reasoning
+    styles, and the defaults currently in effect.
+
+    Read-only and cheap — it builds no model and contacts no provider; it just
+    reports the registries in runtime/models.py and runtime/reasoning.py plus
+    the env-configured defaults. The panel populates its model/style pickers
+    from this instead of hardcoding a list that goes stale the moment a
+    provider is registered (which is one line, see register_provider /
+    register_langchain_provider).
+    """
+    try:
+        from agno_runtime import available_langchain_providers, available_providers, available_styles
+        from runtime.models import (
+            LANGCHAIN_MODEL_ENV_VAR,
+            LANGCHAIN_PROVIDER_ENV_VAR,
+            resolve_langchain_provider,
+            resolve_provider,
+            resolve_thinking,
+        )
+        from runtime.reasoning import STYLE_ENV_VAR
+    except Exception as exc:
+        return JSONResponse({'status': 'error', 'error': str(exc)}, status_code=500)
+
+    backend = os.getenv('AGNO_BACKEND', 'agno').strip().lower()
+    thinking = resolve_thinking()
+    return {
+        'status': 'ok',
+        # Which provider names each backend accepts. They differ: a provider is
+        # only usable on a backend once a builder exists for it there.
+        'providers': {
+            'agno': available_providers(),
+            'langgraph': available_langchain_providers(),
+        },
+        'styles': available_styles(),
+        'defaults': {
+            'backend': backend,
+            'model_provider': resolve_provider(None),
+            'langgraph_provider': resolve_langchain_provider(None),
+            'model_id': os.getenv('AGNO_MODEL'),
+            'langgraph_model_id': os.getenv(LANGCHAIN_MODEL_ENV_VAR),
+            'reasoning_style': os.getenv(STYLE_ENV_VAR) or 'auto',
+            'thinking': thinking.enabled,
+            'thinking_budget': thinking.budget,
+        },
+        'env_vars': {
+            'backend': 'AGNO_BACKEND',
+            'model_provider': 'AGNO_MODEL_PROVIDER',
+            'langgraph_provider': LANGCHAIN_PROVIDER_ENV_VAR,
+            'reasoning_style': STYLE_ENV_VAR,
+        },
+    }
 
 @app.post('/agent/context')
 async def set_context(payload: ContextPayload):
@@ -298,6 +374,9 @@ async def chat_stream_ws(ws: WebSocket):
         model_id = payload.get('model_id')
         base_url = payload.get('base_url')
         graph_path = payload.get('langgraph_graph')
+        reasoning_style = payload.get('reasoning_style')
+        thinking = payload.get('thinking')
+        thinking_budget = payload.get('thinking_budget')
         session_id = payload.get('session_id')
         thread_id = payload.get('thread_id') or session_id or origin
         run_id = str(uuid.uuid4())
@@ -322,6 +401,14 @@ async def chat_stream_ws(ws: WebSocket):
                         knowledge=ctx_kwargs.get('knowledge'),
                         mcp_servers=ctx_kwargs.get('mcp_servers'),
                         tool_meta=ctx_kwargs.get('tool_meta'),
+                        # Same fields the native branch below has always
+                        # honored — the panel sends one payload for both.
+                        model_provider=model_provider,
+                        model_id=model_id,
+                        base_url=base_url,
+                        reasoning_style=reasoning_style,
+                        thinking=thinking,
+                        thinking_budget=thinking_budget,
                     )
                 else:
                     from agno_runtime import build_agent, stream_agno_events
@@ -339,6 +426,9 @@ async def chat_stream_ws(ws: WebSocket):
                         knowledge=ctx_kwargs.get('knowledge'),
                         mcp_servers=ctx_kwargs.get('mcp_servers'),
                         tool_meta=ctx_kwargs.get('tool_meta'),
+                        reasoning_style=reasoning_style,
+                        thinking=thinking,
+                        thinking_budget=thinking_budget,
                     )
                     # run_id (Agno backend only) is what lets a later {"cancel": true}
                     # message stop this specific run cooperatively via Agent.cancel_run
