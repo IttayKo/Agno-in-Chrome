@@ -27,10 +27,14 @@ Note: If `__pycache__` ever appears in the backend directory (e.g., from running
 
 Browser tool registry
 - The runtime now exposes a full browser tool registry for extension-driven page automation, including:
-  - navigate, tabs_context_mcp, tabs_create_mcp, tabs_close_mcp
+  - navigate, tabs_context_mcp, tabs_create_mcp, tabs_close_mcp, switch_browser
   - get_page_text, read_page, find, read_console_messages, read_network_requests
   - form_input, javascript_tool, resize_window, gif_creator, shortcuts_list, shortcuts_execute
   - browser_batch and computer (generic click/type/scroll/keypress/hover actions)
+  - upload_image (uploads a base64/URL image through a page's file input)
+  - update_plan (records the agent's step-by-step plan, readable via GET /agent/plan?plan_id=...)
+- switch_browser re-points the attached CDP debugger at a different tab id without opening or closing anything — unlike tabs_create_mcp/tabs_close_mcp.
+- list_connected_browsers / select_browser operate at the connection level, not per-page: every browser-extension instance that opens a WebSocket to this bridge gets its own browser_id (see GET /agent/browsers), and select_browser can pin all subsequent browser actions to one specific connection when more than one is connected — useful if more than one Chrome profile/window is bridged to the same server at once.
 
 Notes and security
 - The prototype uses in-memory queues and no authentication — bind to localhost only and run in a controlled dev environment.

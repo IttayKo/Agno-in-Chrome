@@ -451,6 +451,64 @@ async def computer_tool(origin: Optional[str] = None, action: Optional[str] = No
         return f"Computer action '{action}' for {origin} was queued but not confirmed."
 
 
+async def browser_switch_browser_tool(origin: Optional[str] = None, tab_id: Optional[int] = None) -> str:
+    if origin is None:
+        origin = os.getenv("BROWSER_ORIGIN", "https://example.com")
+    if tab_id is None:
+        raise ValueError("tab_id is required")
+    try:
+        from server import browser_switch_browser
+        result = await browser_switch_browser(origin, tab_id, timeout=30)
+        return f"Switched active tab to {tab_id}: {result}"
+    except Exception:
+        return f"Switch-browser request for tab {tab_id} was queued but not confirmed."
+
+
+async def browser_upload_image_tool(
+    origin: Optional[str] = None,
+    selector: Optional[str] = None,
+    image_base64: Optional[str] = None,
+    image_url: Optional[str] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+) -> str:
+    if origin is None:
+        origin = os.getenv("BROWSER_ORIGIN", "https://example.com")
+    if not selector:
+        raise ValueError("selector is required")
+    if not image_base64 and not image_url:
+        raise ValueError("image_base64 (with optional mime_type) or image_url is required")
+    try:
+        from server import browser_upload_image
+        result = await browser_upload_image(
+            origin, selector, image_base64=image_base64, image_url=image_url,
+            filename=filename, mime_type=mime_type, timeout=60,
+        )
+        return f"Uploaded image via {selector} on {origin}: {result}"
+    except Exception:
+        return f"Image upload for {selector} on {origin} was queued but not confirmed."
+
+
+async def browser_list_connected_tool() -> str:
+    try:
+        from server import browser_list_connected
+        result = await browser_list_connected()
+        return f"Connected browsers: {result}"
+    except Exception:
+        return "Connected-browsers listing was requested but not available."
+
+
+async def browser_select_tool(browser_id: Optional[str] = None) -> str:
+    if not browser_id:
+        raise ValueError("browser_id is required")
+    try:
+        from server import browser_select
+        result = await browser_select(browser_id)
+        return f"Selected browser {browser_id}: {result}"
+    except Exception:
+        return f"Browser selection for {browser_id} was queued but not confirmed."
+
+
 class _OriginState:
     """Mutable box for "the origin this turn's browser tools currently target."
 
@@ -531,6 +589,25 @@ def _bind_origin(fn, origin_state: "_OriginState"):
     return wrapper
 
 
+def _bind_plain(fn):
+    """Like _bind_origin, but for tools that don't need a per-turn origin at all
+    — list_connected_browsers/select_browser operate on the bridge's connection
+    registry, not a specific page. Still drops stray kwargs some models send
+    instead of blowing up (see _bind_origin's docstring for why that matters)."""
+    import inspect
+    sig = inspect.signature(fn)
+    accepts_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    known_params = set(sig.parameters)
+
+    async def wrapper(**kwargs):
+        if not accepts_var_keyword:
+            kwargs = {k: v for k, v in kwargs.items() if k in known_params}
+        return await fn(**kwargs)
+    wrapper.__name__ = getattr(fn, '__name__', 'tool')
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 def _bind_navigate(origin_state: "_OriginState"):
     """Like _bind_origin(browser_navigate_tool, origin_state), but also
     updates origin_state.origin to the destination's origin the moment
@@ -549,6 +626,53 @@ def _bind_navigate(origin_state: "_OriginState"):
         return f"{result} Now targeting {origin_state.origin} — later tool calls this turn act on this page."
 
     return navigate
+
+
+def _bind_switch_browser(origin_state: "_OriginState"):
+    """Like _bind_navigate, but for switch_browser: re-pointing the CDP
+    debugger at a different tab_id also changes which page later tool calls
+    this turn should target, so origin_state.origin is updated from the
+    switched-to tab's URL the moment the switch confirms."""
+
+    async def switch_browser(tab_id: Optional[int] = None) -> str:
+        if tab_id is None:
+            raise ValueError("tab_id is required")
+        result = await browser_switch_browser_tool(origin=origin_state.origin, tab_id=tab_id)
+        new_origin = _origin_from_url(_result_url(result))
+        if new_origin:
+            origin_state.origin = new_origin
+        return f"{result} Now targeting {origin_state.origin} — later tool calls this turn act on this page."
+
+    return switch_browser
+
+
+def _bind_update_plan(plan_id: str):
+    """update_plan's entrypoint, bound to a fixed plan_id (session_id, or origin
+    when no session_id was given — see build_agent) rather than exposing that
+    routing detail as a model-supplied parameter, the same reasoning _bind_origin
+    uses for origin itself."""
+
+    async def update_plan(plan: Optional[List[dict]] = None, explanation: Optional[str] = None) -> str:
+        if not plan:
+            raise ValueError("plan is required")
+        try:
+            from server import update_plan as _update_plan
+            result = await _update_plan(plan_id, plan, explanation)
+            return f"Plan updated: {result}"
+        except Exception:
+            return "Plan update was requested but not confirmed."
+
+    return update_plan
+
+
+def _result_url(result_text: str) -> Optional[str]:
+    """Best-effort extraction of a 'url': '...' value out of a tool result's
+    string repr (switch_browser's underlying result is a dict rendered via
+    f-string, e.g. "...: {'status': 'ok', 'tabId': 3, 'url': 'https://...', ...}"),
+    so origin_state can be updated without needing a second round trip."""
+    import re
+    match = re.search(r"'url':\s*'([^']*)'", result_text or "")
+    return match.group(1) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1132,76 @@ def build_agent(
                 },
                 entrypoint=_bind_origin(computer_tool, origin_state),
             ),
+            Function(
+                name="switch_browser",
+                description="Switch the active browser tab that all other browser tools target, without opening or closing any tab.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {"type": "integer", "description": "Id of the tab to make active, from tabs_context_mcp"},
+                    },
+                    "required": ["tab_id"],
+                },
+                entrypoint=_bind_switch_browser(origin_state),
+            ),
+            Function(
+                name="upload_image",
+                description="Upload an image through a webpage's file input, given a CSS selector and either base64 image data or an image URL.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "selector": {"type": "string", "description": "CSS selector of the file input element"},
+                        "image_base64": {"type": "string", "description": "Base64-encoded image data (used with mime_type)"},
+                        "image_url": {"type": "string", "description": "URL of an image to fetch and upload instead of image_base64"},
+                        "filename": {"type": "string", "description": "Filename to save the image as before uploading"},
+                        "mime_type": {"type": "string", "description": "MIME type for image_base64, e.g. image/png", "default": "image/png"},
+                    },
+                    "required": ["selector"],
+                },
+                entrypoint=_bind_origin(browser_upload_image_tool, origin_state),
+            ),
+            Function(
+                name="list_connected_browsers",
+                description="List the browser instances currently connected to this bridge, and which one (if any) is selected as the routing target.",
+                parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                entrypoint=_bind_plain(browser_list_connected_tool),
+            ),
+            Function(
+                name="select_browser",
+                description="Route subsequent browser tool calls to one specific connected browser instance, when more than one is connected.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "browser_id": {"type": "string", "description": "Id of the connected browser, from list_connected_browsers"},
+                    },
+                    "required": ["browser_id"],
+                },
+                entrypoint=_bind_plain(browser_select_tool),
+            ),
+            Function(
+                name="update_plan",
+                description="Present or update the agent's step-by-step execution plan before carrying it out.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "array",
+                            "description": "Ordered list of plan steps",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {"type": "string", "description": "Description of this step"},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current status of this step"},
+                                },
+                                "required": ["step", "status"],
+                            },
+                        },
+                        "explanation": {"type": "string", "description": "Optional short explanation of the plan or why it changed"},
+                    },
+                    "required": ["plan"],
+                },
+                entrypoint=_bind_update_plan(session_id or origin),
+            ),
         ])
 
     if extra_tools:
@@ -1229,7 +1423,8 @@ def _deepagents_browser_tools(origin_state: "_OriginState") -> List[Any]:
     from server import (
         browser_navigate, browser_computer, browser_get_page_text, browser_read_page,
         browser_find, browser_javascript_tool, browser_read_console_messages,
-        browser_read_network_requests, browser_form_input,
+        browser_read_network_requests, browser_form_input, browser_switch_browser,
+        browser_upload_image, browser_list_connected, browser_select, update_plan as _update_plan,
     )
 
     async def navigate(url: str) -> str:
@@ -1288,9 +1483,49 @@ def _deepagents_browser_tools(origin_state: "_OriginState") -> List[Any]:
         """Set the value of a form field (input, textarea, or select) identified by a CSS selector."""
         return str(await browser_form_input(origin_state.origin, selector, value, field_type=field_type, timeout=30))
 
+    async def switch_browser(tab_id: int) -> str:
+        """Switch the active browser tab that all other browser tools target, without opening or closing any tab."""
+        result = await browser_switch_browser(origin_state.origin, tab_id, timeout=30)
+        new_origin = _origin_from_url(_result_url(str(result)))
+        if new_origin:
+            origin_state.origin = new_origin
+        return f"{result} Now targeting {origin_state.origin} — later tool calls this turn act on this page."
+
+    async def upload_image(
+        selector: str,
+        image_base64: str = "",
+        image_url: str = "",
+        filename: str = "",
+        mime_type: str = "image/png",
+    ) -> str:
+        """Upload an image through a webpage's file input, given a CSS selector and either base64 image data or an image URL."""
+        if not image_base64 and not image_url:
+            return "image_base64 (with optional mime_type) or image_url is required"
+        return str(await browser_upload_image(
+            origin_state.origin, selector,
+            image_base64=image_base64 or None, image_url=image_url or None,
+            filename=filename or None, mime_type=mime_type or None, timeout=60,
+        ))
+
+    async def list_connected_browsers() -> str:
+        """List the browser instances currently connected to this bridge, and which one (if any) is selected as the routing target."""
+        return str(await browser_list_connected())
+
+    async def select_browser(browser_id: str) -> str:
+        """Route subsequent browser tool calls to one specific connected browser instance, when more than one is connected."""
+        return str(await browser_select(browser_id))
+
+    async def update_plan(plan: List[dict], explanation: str = "") -> str:
+        """Present or update the agent's step-by-step execution plan before carrying it out.
+
+        plan: ordered list of {"step": str, "status": "pending"|"in_progress"|"completed"}.
+        """
+        return str(await _update_plan(origin_state.origin, plan, explanation or None))
+
     return [
         navigate, computer, get_page_text, read_page, find,
         javascript_tool, read_console_messages, read_network_requests, form_input,
+        switch_browser, upload_image, list_connected_browsers, select_browser, update_plan,
     ]
 
 

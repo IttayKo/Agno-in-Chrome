@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uuid
+import time
 import shlex
 import subprocess
 import httpx
@@ -55,8 +56,24 @@ pending_actions: Dict[str, List[Dict[str, Any]]] = {}
 action_events: Dict[str, asyncio.Event] = {}
 action_results: Dict[str, Any] = {}
 
-# Connected websocket clients: list of {'ws': WebSocket, 'origin': Optional[str]}
+# Connected websocket clients: list of {'ws': WebSocket, 'origin': Optional[str],
+# 'browser_id': str, 'connected_at': float}. Each entry is one physical browser
+# instance's extension bridging into this server (typically just one, but the
+# protocol supports several — e.g. more than one Chrome profile/window each
+# running the extension). See list_connected_browsers/select_browser below.
 ws_clients: List[Dict[str, Any]] = []
+
+# When set, routes browser actions to this one connected browser regardless of
+# origin subscription (see broadcast_action) — set via select_browser/POST
+# /agent/browsers/select. None means "fall back to origin-based broadcast",
+# the original (and still default) behavior.
+selected_browser_id: Optional[str] = None
+
+# In-memory per-session agent execution plan (see update_plan tool). Keyed by
+# whatever id the caller passes (session_id, falling back to origin) — purely
+# a display/bookkeeping aid for the panel UI and the model itself, no browser
+# action involved.
+agent_plans: Dict[str, Dict[str, Any]] = {}
 
 class ContextPayload(BaseModel):
     origin: str
@@ -225,7 +242,7 @@ async def get_result(action_id: str):
 @app.websocket('/agent/ws')
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    client = {'ws': ws, 'origin': None}
+    client = {'ws': ws, 'origin': None, 'browser_id': str(uuid.uuid4()), 'connected_at': time.time()}
     ws_clients.append(client)
     try:
         while True:
@@ -236,7 +253,7 @@ async def websocket_endpoint(ws: WebSocket):
                 msg = json.loads(data)
                 if isinstance(msg, dict) and 'subscribe' in msg:
                     client['origin'] = msg.get('subscribe')
-                    await ws.send_text(json_dump({'subscribed': client['origin']}))
+                    await ws.send_text(json_dump({'subscribed': client['origin'], 'browser_id': client['browser_id']}))
                 else:
                     print('WS recv (ignored):', msg)
             except Exception:
@@ -244,6 +261,9 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         if client in ws_clients:
             ws_clients.remove(client)
+        global selected_browser_id
+        if selected_browser_id == client['browser_id']:
+            selected_browser_id = None
 
 
 @app.websocket('/agent/chat_ws')
@@ -373,10 +393,15 @@ async def chat_stream_ws(ws: WebSocket):
 
 async def broadcast_action(action: Dict[str, Any]):
     to_remove = []
-    for client in ws_clients:
+    # A selected browser (see select_browser) takes an action regardless of its
+    # own origin subscription — the caller explicitly chose this connection.
+    # Otherwise, fall back to the original origin-based broadcast filter.
+    targets = ws_clients
+    if selected_browser_id:
+        targets = [c for c in ws_clients if c.get('browser_id') == selected_browser_id]
+    for client in targets:
         try:
-            # Only send to clients subscribed to the action's origin (or all if no origin set)
-            if client.get('origin') and client.get('origin') != action.get('origin'):
+            if not selected_browser_id and client.get('origin') and client.get('origin') != action.get('origin'):
                 continue
             await client['ws'].send_text(json_dump(action))
         except Exception:
@@ -681,6 +706,92 @@ async def browser_batch(origin: str, operations: List[Dict[str, Any]], timeout: 
 
 async def browser_computer(origin: str, action: str, **kwargs: Any) -> Any:
     return await browser_tool_call(origin, 'computer', {'action': action, **kwargs}, timeout=30)
+
+
+async def browser_switch_browser(origin: str, tab_id: int, timeout: int = 30) -> Any:
+    return await browser_tool_call(origin, 'switch_browser', {'tab_id': tab_id}, timeout=timeout)
+
+
+async def browser_upload_image(
+    origin: str,
+    selector: str,
+    image_base64: Optional[str] = None,
+    image_url: Optional[str] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    timeout: int = 60,
+) -> Any:
+    # Downloading the image to disk before handing it to DOM.setFileInputFiles can
+    # take longer than the other, purely in-page actions, hence the higher default timeout.
+    return await browser_tool_call(origin, 'upload_image', {
+        'selector': selector,
+        'image_base64': image_base64,
+        'image_url': image_url,
+        'filename': filename,
+        'mime_type': mime_type,
+    }, timeout=timeout)
+
+
+def list_connected_browsers_data() -> List[Dict[str, Any]]:
+    return [
+        {
+            'browser_id': c['browser_id'],
+            'origin': c.get('origin'),
+            'connected_at': c.get('connected_at'),
+            'selected': c['browser_id'] == selected_browser_id,
+        }
+        for c in ws_clients
+    ]
+
+
+async def browser_list_connected() -> Any:
+    return list_connected_browsers_data()
+
+
+async def browser_select(browser_id: str) -> Any:
+    global selected_browser_id
+    if not any(c['browser_id'] == browser_id for c in ws_clients):
+        return {'status': 'error', 'error': f"No connected browser with id '{browser_id}'"}
+    selected_browser_id = browser_id
+    return {'status': 'ok', 'browser_id': browser_id}
+
+
+@app.get('/agent/browsers')
+async def get_connected_browsers():
+    return {'browsers': list_connected_browsers_data()}
+
+
+class SelectBrowserPayload(BaseModel):
+    browser_id: str
+
+
+@app.post('/agent/browsers/select')
+async def select_browser_endpoint(payload: SelectBrowserPayload):
+    return await browser_select(payload.browser_id)
+
+
+class UpdatePlanPayload(BaseModel):
+    plan_id: str
+    plan: List[Dict[str, Any]]
+    explanation: Optional[str] = None
+
+
+async def update_plan(plan_id: str, plan: List[Dict[str, Any]], explanation: Optional[str] = None) -> Any:
+    """Store/replace the agent's current execution plan for `plan_id` (a
+    session_id, or an origin when no session_id is available). `plan` is a
+    list of {"step": str, "status": "pending"|"in_progress"|"completed"}."""
+    agent_plans[plan_id] = {'plan': plan, 'explanation': explanation}
+    return {'status': 'ok', 'plan_id': plan_id, 'plan': plan, 'explanation': explanation}
+
+
+@app.post('/agent/plan')
+async def update_plan_endpoint(payload: UpdatePlanPayload):
+    return await update_plan(payload.plan_id, payload.plan, payload.explanation)
+
+
+@app.get('/agent/plan')
+async def get_plan(plan_id: str):
+    return agent_plans.get(plan_id, {'plan': [], 'explanation': None})
 
 
 # Simple CLI to run server: uvicorn server:app --reload --port 8000

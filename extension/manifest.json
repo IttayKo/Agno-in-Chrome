@@ -8,7 +8,8 @@
     "activeTab",
     "tabs",
     "storage",
-    "sidePanel"
+    "sidePanel",
+    "downloads"
   ],
   "action": {
     "default_title": "Agno Bridge"

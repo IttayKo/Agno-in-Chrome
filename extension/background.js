@@ -210,6 +210,38 @@ async function doType(text) {
   }
 }
 
+function waitForDownloadComplete(downloadId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      clearTimeout(timer);
+      fn(arg);
+    };
+    const onChanged = (delta) => {
+      if (delta.id !== downloadId) return;
+      if (delta.state && delta.state.current === 'complete') {
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          const item = items && items[0];
+          if (item && item.filename) finish(resolve, item.filename);
+          else finish(reject, new Error('Download completed but no file path was reported'));
+        });
+      } else if (delta.state && delta.state.current === 'interrupted') {
+        finish(reject, new Error('Download was interrupted'));
+      }
+    };
+    const timer = setTimeout(() => finish(reject, new Error('Timed out waiting for download to complete')), timeoutMs);
+    chrome.downloads.onChanged.addListener(onChanged);
+    // The download may already have finished by the time the listener is attached.
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const item = items && items[0];
+      if (item && item.state === 'complete' && item.filename) finish(resolve, item.filename);
+    });
+  });
+}
+
 const browserCapture = { console: [], network: [] };
 function resetBrowserCaptureState() {
   browserCapture.console = [];
@@ -283,6 +315,46 @@ async function handleAction(action) {
     } else if (tool === 'tabs_close_mcp') {
       await chrome.tabs.remove(args.tab_id);
       result = { status: 'ok', tab_id: args.tab_id };
+    } else if (tool === 'switch_browser') {
+      // Re-point the attached CDP debugger (and the action-broadcast subscription)
+      // at a different tab, without creating or closing anything — unlike
+      // tabs_create_mcp/tabs_close_mcp, this only changes which tab is "the
+      // browser" that every other browser_* tool acts on for the rest of the turn.
+      const tabId = args.tab_id;
+      if (!tabId) throw new Error('tab_id is required');
+      await attachToTab(tabId);
+      followActiveTab = true;
+      const tab = await chrome.tabs.get(tabId);
+      const origin = getOriginFromUrl(tab.url);
+      await sendContextForOrigin(origin);
+      subscribeOrigin(origin);
+      result = { status: 'ok', tabId, url: tab.url, origin };
+    } else if (tool === 'upload_image') {
+      // MV3 debugger's DOM.setFileInputFiles needs a real path on disk, which a
+      // service worker can't fabricate directly — save the image via the
+      // downloads API first, then point the file input at that saved path.
+      const selector = args.selector;
+      if (!selector) throw new Error('selector is required');
+      const dataUrl = args.image_base64
+        ? `data:${args.mime_type || 'image/png'};base64,${args.image_base64}`
+        : args.image_url;
+      if (!dataUrl) throw new Error('image_base64 (with optional mime_type) or image_url is required');
+      const filename = args.filename || `agno-upload-${Date.now()}.png`;
+      const downloadId = await new Promise((resolve, reject) => {
+        chrome.downloads.download({ url: dataUrl, filename, saveAs: false, conflictAction: 'uniquify' }, (id) => {
+          const err = chrome.runtime.lastError;
+          if (err) reject(err); else resolve(id);
+        });
+      });
+      const filePath = await waitForDownloadComplete(downloadId);
+      const doc = await sendCDPCommand(attachedDebuggee, 'DOM.getDocument', { depth: -1, pierce: true });
+      const found = await sendCDPCommand(attachedDebuggee, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector });
+      if (!found || !found.nodeId) {
+        result = { status: 'not_found', selector, filePath };
+      } else {
+        await sendCDPCommand(attachedDebuggee, 'DOM.setFileInputFiles', { files: [filePath], nodeId: found.nodeId });
+        result = { status: 'ok', selector, filename, filePath };
+      }
     } else if (tool === 'get_page_text') {
       result = await evaluateInPage('document.body ? document.body.innerText : ""');
     } else if (tool === 'read_page') {
