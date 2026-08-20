@@ -8,6 +8,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusBox = document.getElementById('statusBox');
   const statusText = statusBox ? statusBox.querySelector('.status-text') : null;
   const modelSelect = document.getElementById('modelSelect');
+  const styleSelect = document.getElementById('styleSelect');
 
   // The assistant text node currently receiving stream deltas, if any, plus the
   // raw markdown accumulated for it so far (re-rendered on every delta).
@@ -402,6 +403,96 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // Panel settings that outlive one popup open (the popup is torn down every
+  // time it closes, so anything not stored here resets on the next open).
+  // chrome.storage.local, not sessionStorage: the side panel and the popup are
+  // separate documents and both read this.
+  const SETTINGS_KEY = 'agno:panelSettings';
+
+  async function loadSettings() {
+    try {
+      const stored = await chrome.storage.local.get(SETTINGS_KEY);
+      return (stored && stored[SETTINGS_KEY]) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveSettings(settings) {
+    try { chrome.storage.local.set({ [SETTINGS_KEY]: settings }); } catch (e) {}
+  }
+
+  // Prettier labels for the provider ids the backend reports; anything not
+  // listed falls back to the raw id, so a newly registered provider still shows
+  // up (just unstyled) without touching this file.
+  const PROVIDER_LABELS = {
+    deepseek: 'DeepSeek',
+    openai: 'OpenAI',
+    anthropic: 'Anthropic',
+    gemini: 'Gemini',
+    google: 'Google',
+    vllm: 'vLLM (local)',
+    openai_compatible: 'OpenAI-compatible',
+    custom: 'Custom',
+  };
+
+  function fillSelect(selectEl, values, labelFor, firstLabel, selected) {
+    if (!selectEl) return;
+    selectEl.innerHTML = '';
+    // The empty value means "send nothing", which leaves the backend on its own
+    // configured default — the only option that is guaranteed to work.
+    const options = [['', firstLabel]].concat(values.map((v) => [v, labelFor(v)]));
+    for (const [value, label] of options) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      selectEl.appendChild(opt);
+    }
+    selectEl.value = options.some(([value]) => value === selected) ? selected : '';
+  }
+
+  // Populate the model/style pickers from the backend rather than from a
+  // hardcoded list: which providers exist depends on which packages are
+  // installed and which builders are registered (see backend runtime/models.py),
+  // and which backend is active decides which of the two provider lists applies.
+  async function loadModelOptions() {
+    const settings = await loadSettings();
+    let catalog = null;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
+    try {
+      const resp = await fetch('http://127.0.0.1:8000/agent/models', { signal: controller.signal });
+      if (resp.ok) catalog = await resp.json();
+    } catch (e) {
+      catalog = null; // backend down: keep the fallback options already in the HTML
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (catalog && catalog.providers) {
+      const backend = (catalog.defaults && catalog.defaults.backend) || 'agno';
+      const providers = catalog.providers[backend] || catalog.providers.agno || [];
+      const defaultProvider = (catalog.defaults && (backend === 'langgraph'
+        ? catalog.defaults.langgraph_provider
+        : catalog.defaults.model_provider)) || '';
+      fillSelect(
+        modelSelect, providers,
+        (id) => PROVIDER_LABELS[id] || id,
+        `Default (${PROVIDER_LABELS[defaultProvider] || defaultProvider || 'backend'})`,
+        settings.modelProvider || ''
+      );
+      fillSelect(
+        styleSelect, catalog.styles || [],
+        (id) => `${id} style`,
+        'Auto style',
+        settings.reasoningStyle || ''
+      );
+    } else {
+      if (modelSelect) modelSelect.value = settings.modelProvider || '';
+      if (styleSelect) styleSelect.value = settings.reasoningStyle || '';
+    }
+  }
+
   async function sendPrompt() {
     const displayPrompt = quickCmd ? quickCmd.value.trim() : '';
     if (!displayPrompt) return;
@@ -498,6 +589,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const includeBrowserTools = browserToolsInput ? browserToolsInput.checked : false;
 
+    // One payload for both transports below. Model provider and reasoning style
+    // are omitted entirely when the picker is on its default entry, so an
+    // untouched panel sends exactly what it always did and the backend's own
+    // AGNO_MODEL_PROVIDER / AGNO_LANGGRAPH_PROVIDER / AGNO_REASONING_STYLE win.
+    const chatPayload = { prompt, origin, url: currentUrl, include_browser_tools: includeBrowserTools, session_id: sessionId };
+    if (modelSelect && modelSelect.value) chatPayload.model_provider = modelSelect.value;
+    if (styleSelect && styleSelect.value) chatPayload.reasoning_style = styleSelect.value;
+
     // Resolves with the open, sent WebSocket on success, or null if it never
     // managed to open/send in time — callers should fall back to HTTP in that case.
     function openChatStream() {
@@ -523,7 +622,7 @@ document.addEventListener('DOMContentLoaded', () => {
         socket.onopen = () => {
           clearTimeout(openTimeout);
           try {
-            socket.send(JSON.stringify({ prompt, origin, url: currentUrl, include_browser_tools: includeBrowserTools, session_id: sessionId }));
+            socket.send(JSON.stringify(chatPayload));
             activeSocket = socket;
             settle(socket);
           } catch (e) {
@@ -600,7 +699,7 @@ document.addEventListener('DOMContentLoaded', () => {
       try {
         const resp = await fetch('http://127.0.0.1:8000/agent/chat', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, origin, url: currentUrl, include_browser_tools: includeBrowserTools, session_id: sessionId })
+          body: JSON.stringify(chatPayload)
         });
         const data = await resp.json();
         const assistantText = (data && data.response) ? data.response : (data && data.error ? `Error: ${data.error}` : 'No response');
@@ -652,9 +751,16 @@ document.addEventListener('DOMContentLoaded', () => {
   if (openUiBtn) openUiBtn.addEventListener('click', () => {
     chrome.tabs.create({ url: 'http://127.0.0.1:8000/' });
   });
-  if (modelSelect) modelSelect.addEventListener('change', () => {
-    console.log('Model selection is informational only; set AGNO_MODEL_PROVIDER on the backend to change models.');
-  });
+  // Persist the pickers so a choice survives the panel closing; the values are
+  // sent with every message from then on (see chatPayload in sendPrompt).
+  async function persistPickers() {
+    const settings = await loadSettings();
+    settings.modelProvider = modelSelect ? modelSelect.value : '';
+    settings.reasoningStyle = styleSelect ? styleSelect.value : '';
+    saveSettings(settings);
+  }
+  if (modelSelect) modelSelect.addEventListener('change', persistPickers);
+  if (styleSelect) styleSelect.addEventListener('change', persistPickers);
 
   if (quickCmd) quickCmd.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -680,5 +786,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }).catch(() => {});
 
+  loadModelOptions();
   showEmptyHint();
 });

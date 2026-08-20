@@ -17,6 +17,15 @@
           </div>
         </div>
         <div class="top-actions">
+          <!-- Same two pickers as popup.html (both documents share popup.js,
+               which populates them from GET /agent/models and treats an absent
+               select as "not offered here"). -->
+          <select id="modelSelect" title="Model provider">
+            <option value="">Default model</option>
+          </select>
+          <select id="styleSelect" title="Reasoning style">
+            <option value="">Auto style</option>
+          </select>
           <span id="statusBox" class="status-pill" data-state="idle">
             <span class="status-dot"></span>
             <span class="status-text">Ready</span>

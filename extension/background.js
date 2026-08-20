@@ -192,15 +192,25 @@ function sendCDPCommand(debuggee, method, params = {}) {
   });
 }
 
-async function doClick(x, y) {
+// A CDP click is always press+release at the same point; only `button` and
+// `clickCount` distinguish left/right/double/triple, so they all share one path.
+// clickCount is what actually produces dblclick/tripleclick in the page — sending
+// three separate clickCount:1 clicks does NOT select a paragraph the way a real
+// triple-click does, because the renderer derives those gestures from clickCount.
+async function doMouseClick(x, y, { button = 'left', clickCount = 1 } = {}) {
   if (!attachedDebuggee) throw new Error('Not attached');
-  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  const base = { x, y, button, clickCount };
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...base });
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseReleased', ...base });
 }
 
-async function doScroll(deltaY) {
+async function doClick(x, y) {
+  await doMouseClick(x, y);
+}
+
+async function doScroll(deltaY, x = 0, y = 0, deltaX = 0) {
   if (!attachedDebuggee) throw new Error('Not attached');
-  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x: 0, y: 0, deltaX: 0, deltaY });
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX, deltaY });
 }
 
 async function doType(text) {
@@ -208,6 +218,107 @@ async function doType(text) {
   for (const ch of text) {
     await sendCDPCommand(attachedDebuggee, 'Input.dispatchKeyEvent', { type: 'char', text: ch });
   }
+}
+
+// CDP ignores a bare `key` for most non-printable keys — the renderer keys off
+// windowsVirtualKeyCode, so Enter/Tab/Escape/arrows silently do nothing without
+// it. Only the common navigation/editing keys need entries; printable characters
+// go through doType's `char` events instead.
+const VIRTUAL_KEY_CODES = {
+  Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
+  ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+  Home: 36, End: 35, PageUp: 33, PageDown: 34, Space: 32,
+};
+
+// CDP's modifier bitmask.
+const MODIFIER_BITS = { alt: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, shift: 8 };
+
+// Accepts either a plain key ("Enter") or a combo ("ctrl+a", "shift+Tab").
+function parseKeyCombo(spec) {
+  const parts = String(spec || '').split('+').map(p => p.trim()).filter(Boolean);
+  let modifiers = 0;
+  let key = spec;
+  for (let i = 0; i < parts.length; i++) {
+    const bit = MODIFIER_BITS[parts[i].toLowerCase()];
+    // The final segment is the key itself even when it names a modifier
+    // (e.g. "ctrl" alone), so only fold in bits from non-final segments.
+    if (bit && i < parts.length - 1) modifiers |= bit;
+    else key = parts[i];
+  }
+  return { key, modifiers };
+}
+
+async function doKey(spec) {
+  if (!attachedDebuggee) throw new Error('Not attached');
+  const { key, modifiers } = parseKeyCombo(spec);
+  const canonical = Object.keys(VIRTUAL_KEY_CODES).find(k => k.toLowerCase() === key.toLowerCase());
+  const code = canonical ? VIRTUAL_KEY_CODES[canonical] : undefined;
+  const event = { key: canonical || key, modifiers };
+  if (code !== undefined) {
+    event.windowsVirtualKeyCode = code;
+    event.nativeVirtualKeyCode = code;
+  }
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchKeyEvent', { type: 'keyDown', ...event });
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchKeyEvent', { type: 'keyUp', ...event });
+  return { key: event.key, modifiers };
+}
+
+// A real drag needs the intermediate mouseMoved events — pressing at the origin
+// and releasing at the destination with nothing in between is not recognized as a
+// drag by most drag-and-drop implementations, which track movement deltas.
+async function doDrag(x, y, x2, y2, steps = 10) {
+  if (!attachedDebuggee) throw new Error('Not attached');
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  for (let i = 1; i <= steps; i++) {
+    await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.round(x + ((x2 - x) * i) / steps),
+      y: Math.round(y + ((y2 - y) * i) / steps),
+      button: 'left',
+      buttons: 1,
+    });
+  }
+  await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: x2, y: y2, button: 'left', clickCount: 1 });
+}
+
+async function doScreenshot(format = 'png', quality) {
+  if (!attachedDebuggee) throw new Error('Not attached');
+  const params = { format };
+  if (format === 'jpeg' && quality !== undefined) params.quality = quality;
+  const shot = await sendCDPCommand(attachedDebuggee, 'Page.captureScreenshot', params);
+  return shot && shot.data;
+}
+
+function waitForDownloadComplete(downloadId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      clearTimeout(timer);
+      fn(arg);
+    };
+    const onChanged = (delta) => {
+      if (delta.id !== downloadId) return;
+      if (delta.state && delta.state.current === 'complete') {
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          const item = items && items[0];
+          if (item && item.filename) finish(resolve, item.filename);
+          else finish(reject, new Error('Download completed but no file path was reported'));
+        });
+      } else if (delta.state && delta.state.current === 'interrupted') {
+        finish(reject, new Error('Download was interrupted'));
+      }
+    };
+    const timer = setTimeout(() => finish(reject, new Error('Timed out waiting for download to complete')), timeoutMs);
+    chrome.downloads.onChanged.addListener(onChanged);
+    // The download may already have finished by the time the listener is attached.
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const item = items && items[0];
+      if (item && item.state === 'complete' && item.filename) finish(resolve, item.filename);
+    });
+  });
 }
 
 const browserCapture = { console: [], network: [] };
@@ -283,6 +394,46 @@ async function handleAction(action) {
     } else if (tool === 'tabs_close_mcp') {
       await chrome.tabs.remove(args.tab_id);
       result = { status: 'ok', tab_id: args.tab_id };
+    } else if (tool === 'switch_browser') {
+      // Re-point the attached CDP debugger (and the action-broadcast subscription)
+      // at a different tab, without creating or closing anything — unlike
+      // tabs_create_mcp/tabs_close_mcp, this only changes which tab is "the
+      // browser" that every other browser_* tool acts on for the rest of the turn.
+      const tabId = args.tab_id;
+      if (!tabId) throw new Error('tab_id is required');
+      await attachToTab(tabId);
+      followActiveTab = true;
+      const tab = await chrome.tabs.get(tabId);
+      const origin = getOriginFromUrl(tab.url);
+      await sendContextForOrigin(origin);
+      subscribeOrigin(origin);
+      result = { status: 'ok', tabId, url: tab.url, origin };
+    } else if (tool === 'upload_image') {
+      // MV3 debugger's DOM.setFileInputFiles needs a real path on disk, which a
+      // service worker can't fabricate directly — save the image via the
+      // downloads API first, then point the file input at that saved path.
+      const selector = args.selector;
+      if (!selector) throw new Error('selector is required');
+      const dataUrl = args.image_base64
+        ? `data:${args.mime_type || 'image/png'};base64,${args.image_base64}`
+        : args.image_url;
+      if (!dataUrl) throw new Error('image_base64 (with optional mime_type) or image_url is required');
+      const filename = args.filename || `agno-upload-${Date.now()}.png`;
+      const downloadId = await new Promise((resolve, reject) => {
+        chrome.downloads.download({ url: dataUrl, filename, saveAs: false, conflictAction: 'uniquify' }, (id) => {
+          const err = chrome.runtime.lastError;
+          if (err) reject(err); else resolve(id);
+        });
+      });
+      const filePath = await waitForDownloadComplete(downloadId);
+      const doc = await sendCDPCommand(attachedDebuggee, 'DOM.getDocument', { depth: -1, pierce: true });
+      const found = await sendCDPCommand(attachedDebuggee, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector });
+      if (!found || !found.nodeId) {
+        result = { status: 'not_found', selector, filePath };
+      } else {
+        await sendCDPCommand(attachedDebuggee, 'DOM.setFileInputFiles', { files: [filePath], nodeId: found.nodeId });
+        result = { status: 'ok', selector, filename, filePath };
+      }
     } else if (tool === 'get_page_text') {
       result = await evaluateInPage('document.body ? document.body.innerText : ""');
     } else if (tool === 'read_page') {
@@ -347,11 +498,37 @@ async function handleAction(action) {
       await chrome.windows.update(current.id, { width, height });
       result = { status: 'ok', width, height };
     } else if (tool === 'gif_creator') {
+      // Records the tab as a frame sequence via repeated Page.captureScreenshot.
+      // Deliberately NOT encoded as an actual .gif: a GIF encoder (LZW + palette
+      // quantization) is a large dependency to inline in a service worker, and the
+      // frames are what a caller actually needs to either assemble a GIF elsewhere
+      // or feed to a vision model. The result says `frames`, not `gif`, so no
+      // caller is misled into thinking it received an encoded image.
+      const durationMs = Math.min(args.duration_ms || 3000, 30000);
+      const fps = Math.min(args.fps || 4, 10);
+      const frameCount = Math.max(1, Math.round((durationMs / 1000) * fps));
+      const intervalMs = Math.round(durationMs / frameCount);
+      const frames = [];
+      for (let i = 0; i < frameCount; i++) {
+        const startedAt = Date.now();
+        try {
+          frames.push({ index: i, timestamp: startedAt, image_base64: await doScreenshot('png') });
+        } catch (e) {
+          frames.push({ index: i, timestamp: startedAt, error: e && e.message ? e.message : String(e) });
+        }
+        // Subtract the capture's own cost so the frames stay near the requested
+        // interval instead of drifting longer with every iteration.
+        const remaining = intervalMs - (Date.now() - startedAt);
+        if (i < frameCount - 1 && remaining > 0) await new Promise(r => setTimeout(r, remaining));
+      }
       result = {
-        status: 'stub',
-        message: 'GIF capture is not available in the prototype; implement a screen recorder or screenshot pipeline if you need a real GIF.',
-        duration_ms: args.duration_ms || 3000,
-        title: args.title || null
+        status: 'ok',
+        format: 'png_frame_sequence',
+        title: args.title || null,
+        duration_ms: durationMs,
+        fps,
+        frame_count: frames.length,
+        frames
       };
     } else if (tool === 'shortcuts_list') {
       result = [
@@ -374,27 +551,74 @@ async function handleAction(action) {
       }
       result = results;
     } else if (tool === 'computer') {
+      // `computer` is a compound interaction tool, not one primitive: the model
+      // picks an action from this surface rather than choosing between a dozen
+      // separate top-level tools. Aliases are accepted for the actions that have
+      // two common spellings (click/left_click, key/keypress, drag/left_click_drag)
+      // so a model trained on either naming convention works without a retry.
       const actionName = (args.action || '').toLowerCase();
-      if (actionName === 'click') {
-        await doClick(args.x || 0, args.y || 0);
-        result = { status: 'ok', action: 'click', x: args.x || 0, y: args.y || 0 };
-      } else if (actionName === 'scroll') {
-        const deltaY = args.delta_y || 0;
-        await doScroll(deltaY);
-        result = { status: 'ok', action: 'scroll', delta_y: deltaY };
+      const x = args.x || 0;
+      const y = args.y || 0;
+      if (actionName === 'screenshot') {
+        const data = await doScreenshot(args.format || 'png', args.quality);
+        result = { status: 'ok', action: 'screenshot', format: args.format || 'png', image_base64: data };
+      } else if (actionName === 'click' || actionName === 'left_click') {
+        await doMouseClick(x, y);
+        result = { status: 'ok', action: 'left_click', x, y };
+      } else if (actionName === 'right_click') {
+        await doMouseClick(x, y, { button: 'right' });
+        result = { status: 'ok', action: 'right_click', x, y };
+      } else if (actionName === 'double_click') {
+        await doMouseClick(x, y, { clickCount: 2 });
+        result = { status: 'ok', action: 'double_click', x, y };
+      } else if (actionName === 'triple_click') {
+        await doMouseClick(x, y, { clickCount: 3 });
+        result = { status: 'ok', action: 'triple_click', x, y };
       } else if (actionName === 'type') {
         await doType(args.text || '');
         result = { status: 'ok', action: 'type', text: (args.text || '').slice(0, 100) };
-      } else if (actionName === 'keypress') {
-        const key = args.key || 'Enter';
-        await sendCDPCommand(attachedDebuggee, 'Input.dispatchKeyEvent', { type: 'keyDown', key });
-        await sendCDPCommand(attachedDebuggee, 'Input.dispatchKeyEvent', { type: 'keyUp', key });
-        result = { status: 'ok', action: 'keypress', key };
+      } else if (actionName === 'key' || actionName === 'keypress') {
+        const pressed = await doKey(args.key || 'Enter');
+        result = { status: 'ok', action: 'key', ...pressed };
+      } else if (actionName === 'scroll') {
+        const deltaY = args.delta_y || 0;
+        const deltaX = args.delta_x || 0;
+        await doScroll(deltaY, x, y, deltaX);
+        result = { status: 'ok', action: 'scroll', delta_x: deltaX, delta_y: deltaY, x, y };
+      } else if (actionName === 'scroll_to') {
+        // Scrolls a specific element into view when a selector is given, otherwise
+        // jumps to absolute page coordinates.
+        const selector = args.selector;
+        if (selector) {
+          result = await evaluateInPage(`(() => {
+            const el = document.querySelector(${JSON.stringify(selector)});
+            if (!el) return { status: 'not_found', selector: ${JSON.stringify(selector)} };
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const r = el.getBoundingClientRect();
+            return { status: 'ok', selector: ${JSON.stringify(selector)}, x: Math.round(r.x), y: Math.round(r.y) };
+          })()`);
+        } else {
+          await evaluateInPage(`window.scrollTo(${Number(x) || 0}, ${Number(y) || 0})`);
+          result = { status: 'ok', action: 'scroll_to', x, y };
+        }
       } else if (actionName === 'hover') {
-        await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: args.x || 0, y: args.y || 0, buttons: 0 });
-        result = { status: 'ok', action: 'hover', x: args.x || 0, y: args.y || 0 };
-      } else if (actionName === 'drag') {
-        result = { status: 'stub', action: 'drag', x: args.x || 0, y: args.y || 0 };
+        await sendCDPCommand(attachedDebuggee, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, buttons: 0 });
+        result = { status: 'ok', action: 'hover', x, y };
+      } else if (actionName === 'drag' || actionName === 'left_click_drag') {
+        const x2 = args.x2 !== undefined ? args.x2 : (args.to_x || 0);
+        const y2 = args.y2 !== undefined ? args.y2 : (args.to_y || 0);
+        await doDrag(x, y, x2, y2);
+        result = { status: 'ok', action: 'left_click_drag', from: { x, y }, to: { x: x2, y: y2 } };
+      } else if (actionName === 'zoom') {
+        // Emulation.setPageScaleFactor is the pinch-zoom equivalent and leaves
+        // layout alone, unlike setting a CSS zoom which reflows the page.
+        const factor = args.factor || args.scale || 1;
+        await sendCDPCommand(attachedDebuggee, 'Emulation.setPageScaleFactor', { pageScaleFactor: factor });
+        result = { status: 'ok', action: 'zoom', factor };
+      } else if (actionName === 'wait') {
+        const ms = Math.min(args.duration_ms || args.ms || 1000, 30000);
+        await new Promise(r => setTimeout(r, ms));
+        result = { status: 'ok', action: 'wait', duration_ms: ms };
       } else {
         result = { status: 'unknown_action', action: actionName };
       }

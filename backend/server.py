@@ -21,10 +21,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uuid
+import time
 import shlex
 import subprocess
 import httpx
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 # Load .env at process start, not as a side effect of the first request that
 # happens to lazily `from agno_runtime import ...`. AGNO_BACKEND (and every
@@ -55,8 +56,24 @@ pending_actions: Dict[str, List[Dict[str, Any]]] = {}
 action_events: Dict[str, asyncio.Event] = {}
 action_results: Dict[str, Any] = {}
 
-# Connected websocket clients: list of {'ws': WebSocket, 'origin': Optional[str]}
+# Connected websocket clients: list of {'ws': WebSocket, 'origin': Optional[str],
+# 'browser_id': str, 'connected_at': float}. Each entry is one physical browser
+# instance's extension bridging into this server (typically just one, but the
+# protocol supports several — e.g. more than one Chrome profile/window each
+# running the extension). See list_connected_browsers/select_browser below.
 ws_clients: List[Dict[str, Any]] = []
+
+# When set, routes browser actions to this one connected browser regardless of
+# origin subscription (see broadcast_action) — set via select_browser/POST
+# /agent/browsers/select. None means "fall back to origin-based broadcast",
+# the original (and still default) behavior.
+selected_browser_id: Optional[str] = None
+
+# In-memory per-session agent execution plan (see update_plan tool). Keyed by
+# whatever id the caller passes (session_id, falling back to origin) — purely
+# a display/bookkeeping aid for the panel UI and the model itself, no browser
+# action involved.
+agent_plans: Dict[str, Dict[str, Any]] = {}
 
 class ContextPayload(BaseModel):
     origin: str
@@ -85,6 +102,15 @@ class ChatPayload(BaseModel):
     langgraph_graph: Optional[str] = None  # overrides LANGGRAPH_GRAPH, 'module.path:graph_var'
     thread_id: Optional[str] = None        # LangGraph checkpointer thread id
     session_id: Optional[str] = None       # stable per-conversation id so later turns see earlier ones
+    # How this model expresses thinking vs. answer text: a registered style name
+    # from runtime/reasoning.py ('deepseek' | 'openai' | 'anthropic' | 'gemini' |
+    # 'plain'), or 'auto'/None to resolve it from the selected provider.
+    reasoning_style: Optional[str] = None
+    # Ask the provider for thinking output where it has to be asked (Anthropic,
+    # Gemini, OpenAI reasoning models). None = leave it to AGNO_THINKING, and to
+    # the provider's own default if that is unset too — see runtime/models.py.
+    thinking: Optional[Union[bool, str]] = None   # true/false, '1'/'0', or 'low'/'medium'/'high'
+    thinking_budget: Optional[int] = None  # thinking token budget, where supported
 
 @app.get('/', response_class=HTMLResponse)
 async def read_root():
@@ -114,6 +140,16 @@ async def chat(payload: ChatPayload):
                 knowledge=ctx_kwargs.get('knowledge'),
                 mcp_servers=ctx_kwargs.get('mcp_servers'),
                 tool_meta=ctx_kwargs.get('tool_meta'),
+                # Model/style selection reaches this backend too: before, these
+                # payload fields were honored only by the native branch below,
+                # so the panel's model picker silently did nothing whenever the
+                # LangGraph backend was active.
+                model_provider=payload.model_provider,
+                model_id=payload.model_id,
+                base_url=payload.base_url,
+                reasoning_style=payload.reasoning_style,
+                thinking=payload.thinking,
+                thinking_budget=payload.thinking_budget,
             ):
                 if evt.get('type') == 'assistant.delta':
                     response_parts.append(evt.get('chunk') or '')
@@ -138,6 +174,9 @@ async def chat(payload: ChatPayload):
             knowledge=ctx_kwargs.get('knowledge'),
             mcp_servers=ctx_kwargs.get('mcp_servers'),
             tool_meta=ctx_kwargs.get('tool_meta'),
+            reasoning_style=payload.reasoning_style,
+            thinking=payload.thinking,
+            thinking_budget=payload.thinking_budget,
         )
         result = await agent.arun(payload.prompt)
         response = getattr(result, 'content', str(result))
@@ -155,6 +194,60 @@ async def chat(payload: ChatPayload):
         return {'response': response, 'tool_trace': trace, 'status': 'ok'}
     except Exception as exc:
         return JSONResponse({'status': 'error', 'error': str(exc)}, status_code=500)
+
+@app.get('/agent/models')
+async def list_models():
+    """What this backend can be pointed at: providers per backend, reasoning
+    styles, and the defaults currently in effect.
+
+    Read-only and cheap — it builds no model and contacts no provider; it just
+    reports the registries in runtime/models.py and runtime/reasoning.py plus
+    the env-configured defaults. The panel populates its model/style pickers
+    from this instead of hardcoding a list that goes stale the moment a
+    provider is registered (which is one line, see register_provider /
+    register_langchain_provider).
+    """
+    try:
+        from agno_runtime import available_langchain_providers, available_providers, available_styles
+        from runtime.models import (
+            LANGCHAIN_MODEL_ENV_VAR,
+            LANGCHAIN_PROVIDER_ENV_VAR,
+            resolve_langchain_provider,
+            resolve_provider,
+            resolve_thinking,
+        )
+        from runtime.reasoning import STYLE_ENV_VAR
+    except Exception as exc:
+        return JSONResponse({'status': 'error', 'error': str(exc)}, status_code=500)
+
+    backend = os.getenv('AGNO_BACKEND', 'agno').strip().lower()
+    thinking = resolve_thinking()
+    return {
+        'status': 'ok',
+        # Which provider names each backend accepts. They differ: a provider is
+        # only usable on a backend once a builder exists for it there.
+        'providers': {
+            'agno': available_providers(),
+            'langgraph': available_langchain_providers(),
+        },
+        'styles': available_styles(),
+        'defaults': {
+            'backend': backend,
+            'model_provider': resolve_provider(None),
+            'langgraph_provider': resolve_langchain_provider(None),
+            'model_id': os.getenv('AGNO_MODEL'),
+            'langgraph_model_id': os.getenv(LANGCHAIN_MODEL_ENV_VAR),
+            'reasoning_style': os.getenv(STYLE_ENV_VAR) or 'auto',
+            'thinking': thinking.enabled,
+            'thinking_budget': thinking.budget,
+        },
+        'env_vars': {
+            'backend': 'AGNO_BACKEND',
+            'model_provider': 'AGNO_MODEL_PROVIDER',
+            'langgraph_provider': LANGCHAIN_PROVIDER_ENV_VAR,
+            'reasoning_style': STYLE_ENV_VAR,
+        },
+    }
 
 @app.post('/agent/context')
 async def set_context(payload: ContextPayload):
@@ -225,7 +318,7 @@ async def get_result(action_id: str):
 @app.websocket('/agent/ws')
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    client = {'ws': ws, 'origin': None}
+    client = {'ws': ws, 'origin': None, 'browser_id': str(uuid.uuid4()), 'connected_at': time.time()}
     ws_clients.append(client)
     try:
         while True:
@@ -236,7 +329,7 @@ async def websocket_endpoint(ws: WebSocket):
                 msg = json.loads(data)
                 if isinstance(msg, dict) and 'subscribe' in msg:
                     client['origin'] = msg.get('subscribe')
-                    await ws.send_text(json_dump({'subscribed': client['origin']}))
+                    await ws.send_text(json_dump({'subscribed': client['origin'], 'browser_id': client['browser_id']}))
                 else:
                     print('WS recv (ignored):', msg)
             except Exception:
@@ -244,6 +337,9 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         if client in ws_clients:
             ws_clients.remove(client)
+        global selected_browser_id
+        if selected_browser_id == client['browser_id']:
+            selected_browser_id = None
 
 
 @app.websocket('/agent/chat_ws')
@@ -278,6 +374,9 @@ async def chat_stream_ws(ws: WebSocket):
         model_id = payload.get('model_id')
         base_url = payload.get('base_url')
         graph_path = payload.get('langgraph_graph')
+        reasoning_style = payload.get('reasoning_style')
+        thinking = payload.get('thinking')
+        thinking_budget = payload.get('thinking_budget')
         session_id = payload.get('session_id')
         thread_id = payload.get('thread_id') or session_id or origin
         run_id = str(uuid.uuid4())
@@ -302,6 +401,14 @@ async def chat_stream_ws(ws: WebSocket):
                         knowledge=ctx_kwargs.get('knowledge'),
                         mcp_servers=ctx_kwargs.get('mcp_servers'),
                         tool_meta=ctx_kwargs.get('tool_meta'),
+                        # Same fields the native branch below has always
+                        # honored — the panel sends one payload for both.
+                        model_provider=model_provider,
+                        model_id=model_id,
+                        base_url=base_url,
+                        reasoning_style=reasoning_style,
+                        thinking=thinking,
+                        thinking_budget=thinking_budget,
                     )
                 else:
                     from agno_runtime import build_agent, stream_agno_events
@@ -319,6 +426,9 @@ async def chat_stream_ws(ws: WebSocket):
                         knowledge=ctx_kwargs.get('knowledge'),
                         mcp_servers=ctx_kwargs.get('mcp_servers'),
                         tool_meta=ctx_kwargs.get('tool_meta'),
+                        reasoning_style=reasoning_style,
+                        thinking=thinking,
+                        thinking_budget=thinking_budget,
                     )
                     # run_id (Agno backend only) is what lets a later {"cancel": true}
                     # message stop this specific run cooperatively via Agent.cancel_run
@@ -373,10 +483,15 @@ async def chat_stream_ws(ws: WebSocket):
 
 async def broadcast_action(action: Dict[str, Any]):
     to_remove = []
-    for client in ws_clients:
+    # A selected browser (see select_browser) takes an action regardless of its
+    # own origin subscription — the caller explicitly chose this connection.
+    # Otherwise, fall back to the original origin-based broadcast filter.
+    targets = ws_clients
+    if selected_browser_id:
+        targets = [c for c in ws_clients if c.get('browser_id') == selected_browser_id]
+    for client in targets:
         try:
-            # Only send to clients subscribed to the action's origin (or all if no origin set)
-            if client.get('origin') and client.get('origin') != action.get('origin'):
+            if not selected_browser_id and client.get('origin') and client.get('origin') != action.get('origin'):
                 continue
             await client['ws'].send_text(json_dump(action))
         except Exception:
@@ -681,6 +796,92 @@ async def browser_batch(origin: str, operations: List[Dict[str, Any]], timeout: 
 
 async def browser_computer(origin: str, action: str, **kwargs: Any) -> Any:
     return await browser_tool_call(origin, 'computer', {'action': action, **kwargs}, timeout=30)
+
+
+async def browser_switch_browser(origin: str, tab_id: int, timeout: int = 30) -> Any:
+    return await browser_tool_call(origin, 'switch_browser', {'tab_id': tab_id}, timeout=timeout)
+
+
+async def browser_upload_image(
+    origin: str,
+    selector: str,
+    image_base64: Optional[str] = None,
+    image_url: Optional[str] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    timeout: int = 60,
+) -> Any:
+    # Downloading the image to disk before handing it to DOM.setFileInputFiles can
+    # take longer than the other, purely in-page actions, hence the higher default timeout.
+    return await browser_tool_call(origin, 'upload_image', {
+        'selector': selector,
+        'image_base64': image_base64,
+        'image_url': image_url,
+        'filename': filename,
+        'mime_type': mime_type,
+    }, timeout=timeout)
+
+
+def list_connected_browsers_data() -> List[Dict[str, Any]]:
+    return [
+        {
+            'browser_id': c['browser_id'],
+            'origin': c.get('origin'),
+            'connected_at': c.get('connected_at'),
+            'selected': c['browser_id'] == selected_browser_id,
+        }
+        for c in ws_clients
+    ]
+
+
+async def browser_list_connected() -> Any:
+    return list_connected_browsers_data()
+
+
+async def browser_select(browser_id: str) -> Any:
+    global selected_browser_id
+    if not any(c['browser_id'] == browser_id for c in ws_clients):
+        return {'status': 'error', 'error': f"No connected browser with id '{browser_id}'"}
+    selected_browser_id = browser_id
+    return {'status': 'ok', 'browser_id': browser_id}
+
+
+@app.get('/agent/browsers')
+async def get_connected_browsers():
+    return {'browsers': list_connected_browsers_data()}
+
+
+class SelectBrowserPayload(BaseModel):
+    browser_id: str
+
+
+@app.post('/agent/browsers/select')
+async def select_browser_endpoint(payload: SelectBrowserPayload):
+    return await browser_select(payload.browser_id)
+
+
+class UpdatePlanPayload(BaseModel):
+    plan_id: str
+    plan: List[Dict[str, Any]]
+    explanation: Optional[str] = None
+
+
+async def update_plan(plan_id: str, plan: List[Dict[str, Any]], explanation: Optional[str] = None) -> Any:
+    """Store/replace the agent's current execution plan for `plan_id` (a
+    session_id, or an origin when no session_id is available). `plan` is a
+    list of {"step": str, "status": "pending"|"in_progress"|"completed"}."""
+    agent_plans[plan_id] = {'plan': plan, 'explanation': explanation}
+    return {'status': 'ok', 'plan_id': plan_id, 'plan': plan, 'explanation': explanation}
+
+
+@app.post('/agent/plan')
+async def update_plan_endpoint(payload: UpdatePlanPayload):
+    return await update_plan(payload.plan_id, payload.plan, payload.explanation)
+
+
+@app.get('/agent/plan')
+async def get_plan(plan_id: str):
+    return agent_plans.get(plan_id, {'plan': [], 'explanation': None})
 
 
 # Simple CLI to run server: uvicorn server:app --reload --port 8000
